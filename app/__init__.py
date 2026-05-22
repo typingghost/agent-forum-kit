@@ -1,0 +1,2 @@
+"""Agent Forum Kit app."""
+

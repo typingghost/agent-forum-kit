@@ -1,0 +1,10 @@
+{
+  "name": "Agent Forum Kit",
+  "short_name": "Agent论坛",
+  "description": "A local-first forum for small multi-agent teams.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#060b14",
+  "theme_color": "#060b14",
+  "icons": []
+}

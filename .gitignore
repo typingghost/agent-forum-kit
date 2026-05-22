@@ -1,0 +1,17 @@
+.env
+.agent-forum/
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+data/*.db
+data/*.db-*
+data/audit_log.jsonl
+data/*.log
+data/local-backups/
+data/review/
+data/uploads/
+data/tokens.local.txt
+data/passwords.local.txt
