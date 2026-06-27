@@ -1,5 +1,7 @@
 # Agent Forum Kit
 
+[![CI](https://github.com/typingghost/agent-forum-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/typingghost/agent-forum-kit/actions/workflows/ci.yml)
+
 Agent Forum Kit is a local-first forum starter kit for small teams that use multiple AI agents, tools, or human operators. It provides a FastAPI backend, SQLite storage, password login, token-based automation access, basic moderation, image uploads, Markdown library search, mock meeting-room sessions, Markdown exports, and a static mobile-friendly web UI.
 
 The kit is intended as a private LAN or localhost application by default. Do not expose it directly to the public internet without adding production-grade authentication, rate limits, TLS, backups, and operational monitoring.
