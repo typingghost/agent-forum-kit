@@ -6,10 +6,11 @@ import binascii
 import json
 import re
 import shutil
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from app.auth import Actor, hash_password, hash_token, require_actor, resolve_acting_user_id, verify_password
 from app.config import settings
@@ -58,6 +59,13 @@ ALLOWED_IMAGE_TYPES = {
     "image/webp": ".webp",
 }
 MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024
+PERSONAL_LIST_MODES = {"latest", "related", "mentions", "replies", "action_required"}
+PERSONA_ALIAS_HINTS = {
+    "agent_alpha": ["Alpha", "A1", "agent-alpha"],
+    "agent_beta": ["Beta", "B2", "agent-beta"],
+    "admin": ["operator", "ops"],
+    "moderator": ["mod"],
+}
 
 
 def agent_from_prefix(row: dict, prefix: str) -> Agent:
@@ -80,6 +88,140 @@ def agent_from_user_row(row: dict) -> Agent:
         avatar_color=row["avatar_color"],
         avatar_emoji=row.get("avatar_emoji"),
     )
+
+
+def get_active_user_for_export(target: str) -> dict:
+    target = target.strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="target is required")
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, username, display_name, role, persona_id, avatar_color, avatar_emoji
+            FROM users
+            WHERE status = 'active' AND (username = ? OR persona_id = ?)
+            """,
+            (target, target),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Target agent not found")
+    return dict(row)
+
+
+def target_aliases(user: dict, extra_aliases: str | None = None) -> list[str]:
+    aliases: list[str] = [
+        str(user["username"]),
+        str(user["display_name"]),
+    ]
+    if user.get("persona_id"):
+        aliases.append(str(user["persona_id"]))
+    for part in re.split(r"[/|,，\s]+", str(user["display_name"])):
+        if part.strip():
+            aliases.append(part.strip())
+    aliases.extend(PERSONA_ALIAS_HINTS.get(str(user["username"]).lower(), []))
+    if extra_aliases:
+        aliases.extend(part.strip() for part in re.split(r"[,，\n]+", extra_aliases) if part.strip())
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        alias = alias.strip()
+        if not alias or len(alias) > 80:
+            continue
+        key = alias.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(alias)
+        if len(unique) >= 20:
+            break
+    return unique
+
+
+def is_short_latin_alias(alias: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,2}", alias))
+
+
+def alias_like_patterns(alias: str) -> list[str]:
+    if not is_short_latin_alias(alias):
+        return [f"%{alias}%"]
+    return [
+        f"%@{alias}%",
+        f"{alias} %",
+        f"% {alias} %",
+        f"% {alias}",
+        f"{alias},%",
+        f"%,{alias}%",
+        f"%, {alias}%",
+        f"%/{alias}%",
+        f"%({alias})%",
+        f"%[{alias}]%",
+    ]
+
+
+def mention_filter_sql(aliases: list[str]) -> tuple[str, list[object]]:
+    mention_clauses: list[str] = []
+    mention_params: list[object] = []
+    for alias in aliases:
+        for pattern in alias_like_patterns(alias):
+            mention_clauses.append("threads.title LIKE ?")
+            mention_params.append(pattern)
+            mention_clauses.append(
+                """
+                EXISTS (
+                  SELECT 1 FROM posts mention_posts
+                  WHERE mention_posts.thread_id = threads.id
+                    AND mention_posts.status = 'visible'
+                    AND mention_posts.body_markdown LIKE ?
+                )
+                """
+            )
+            mention_params.append(pattern)
+    return "(" + " OR ".join(mention_clauses) + ")" if mention_clauses else "0", mention_params
+
+
+def personal_filter(mode: str, target_user_id: int, aliases: list[str]) -> tuple[list[str], list[object]]:
+    if mode == "latest":
+        return [], []
+    mention_sql, mention_params = mention_filter_sql(aliases)
+    replies_sql = """
+    EXISTS (
+      SELECT 1
+      FROM posts mine
+      JOIN posts other ON other.thread_id = mine.thread_id
+      WHERE mine.thread_id = threads.id
+        AND mine.author_user_id = ?
+        AND mine.status = 'visible'
+        AND other.status = 'visible'
+        AND other.author_user_id != ?
+        AND (
+          other.parent_post_id = mine.id
+          OR other.created_at > mine.created_at
+        )
+    )
+    """
+    replies_params: list[object] = [target_user_id, target_user_id]
+    operator_participated_sql = """
+    EXISTS (
+      SELECT 1
+      FROM posts operator_posts
+      JOIN users operator_user ON operator_user.id = operator_posts.author_user_id
+      WHERE operator_posts.thread_id = threads.id
+        AND operator_posts.status = 'visible'
+        AND operator_user.role IN ('admin', 'moderator')
+    )
+    """
+    if mode == "mentions":
+        return [mention_sql], mention_params
+    if mode == "replies":
+        return [replies_sql], replies_params
+    if mode == "related":
+        return [f"({mention_sql} OR {replies_sql})"], mention_params + replies_params
+    if mode == "action_required":
+        return [
+            f"(({mention_sql} OR {replies_sql} OR {operator_participated_sql}) AND latest_author.id != ?)"
+        ], mention_params + replies_params + [target_user_id]
+    raise HTTPException(status_code=400, detail="Unknown personal list mode")
 
 
 def upload_root() -> Path:
@@ -998,29 +1140,163 @@ def list_threads(
     board: str | None = Query(default=None),
     sort: str = Query(default="latest", pattern="^(latest|hot)$"),
     limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=200),
 ) -> list[ThreadSummary]:
+    _total, threads = fetch_thread_summaries(board, sort, limit, offset, q)
+    return threads
+
+
+def fetch_thread_summaries(
+    board: str | None,
+    sort: str,
+    limit: int,
+    offset: int = 0,
+    q: str | None = None,
+    extra_where: list[str] | None = None,
+    extra_params: list[object] | None = None,
+) -> tuple[int, list[ThreadSummary]]:
     where = ["threads.status != 'deleted'"]
     params: list[object] = []
     if board:
         where.append("boards.slug = ?")
         params.append(board)
+    if q and q.strip():
+        needle = f"%{q.strip()}%"
+        where.append(
+            """
+            (
+              threads.title LIKE ?
+              OR first_post.body_markdown LIKE ?
+              OR latest_post.body_markdown LIKE ?
+            )
+            """
+        )
+        params.extend([needle, needle, needle])
+    if extra_where:
+        where.extend(extra_where)
+        params.extend(extra_params or [])
     order_by = "threads.is_pinned DESC, threads.updated_at DESC"
     if sort == "hot":
         order_by = "threads.is_pinned DESC, reply_count DESC, threads.updated_at DESC"
-    sql = (
-        thread_query()
-        + " AND "
-        + " AND ".join(where)
-        + f"""
-        GROUP BY threads.id
-        ORDER BY {order_by}
-        LIMIT ?
-        """
-    )
-    params.append(limit)
+    base_sql = thread_query() + " AND " + " AND ".join(where) + " GROUP BY threads.id"
     with get_connection() as conn:
-        rows = conn.execute(sql, tuple(params)).fetchall()
-    return [thread_summary_from_row(dict(row)) for row in rows]
+        count_sql = f"SELECT COUNT(*) AS count FROM ({base_sql}) AS filtered_threads"
+        total = int(conn.execute(count_sql, tuple(params)).fetchone()["count"])
+        rows = conn.execute(
+            base_sql + f" ORDER BY {order_by} LIMIT ? OFFSET ?",
+            tuple(params + [limit, offset]),
+        ).fetchall()
+    return total, [thread_summary_from_row(dict(row)) for row in rows]
+
+
+@router.get("/threads/export.md")
+def download_thread_list_markdown(
+    board: str | None = Query(default=None),
+    sort: str = Query(default="latest", pattern="^(latest|hot)$"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=200),
+    actor: Actor = Depends(require_actor),
+) -> Response:
+    total, threads = fetch_thread_summaries(board, sort, limit, offset, q)
+    body = render_thread_list_markdown(
+        threads=threads,
+        total=total,
+        board=board,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+        q=q,
+        requested_by=actor.username,
+    )
+    filename = thread_list_export_filename(board=board, sort=sort, q=q)
+    append_audit(
+        "thread_list.export.download",
+        {
+            "performed_by": actor.username,
+            "acting_as": actor.username,
+            "source": "api",
+            "board": board,
+            "sort": sort,
+            "limit": limit,
+            "offset": offset,
+            "q": q,
+            "filename": filename,
+        },
+    )
+    return Response(
+        content=body,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/threads/personal-export.md")
+def download_personal_thread_list_markdown(
+    target: str = Query(..., min_length=1, max_length=80),
+    mode: str = Query(default="related", pattern="^(latest|related|mentions|replies|action_required)$"),
+    board: str | None = Query(default=None),
+    sort: str = Query(default="latest", pattern="^(latest|hot)$"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None, max_length=200),
+    aliases: str | None = Query(default=None, max_length=500),
+    actor: Actor = Depends(require_actor),
+) -> Response:
+    target_user = get_active_user_for_export(target)
+    alias_list = target_aliases(target_user, aliases)
+    effective_sort = "latest" if mode == "action_required" else sort
+    extra_where, extra_params = personal_filter(mode, int(target_user["id"]), alias_list)
+    total, threads = fetch_thread_summaries(
+        board,
+        effective_sort,
+        limit,
+        offset,
+        q,
+        extra_where=extra_where,
+        extra_params=extra_params,
+    )
+    reasons = personal_match_reasons(threads, int(target_user["id"]), alias_list) if mode != "latest" else {}
+    match_snippets = alias_match_snippets(threads, alias_list) if mode != "latest" else {}
+    body = render_thread_list_markdown(
+        threads=threads,
+        total=total,
+        board=board,
+        sort=effective_sort,
+        limit=limit,
+        offset=offset,
+        q=q,
+        requested_by=actor.username,
+        target_user=target_user,
+        personal_mode=mode,
+        aliases=alias_list,
+        reasons=reasons,
+        match_snippets=match_snippets,
+    )
+    filename = personal_thread_list_export_filename(target_user, mode, board, effective_sort, q)
+    append_audit(
+        "thread_list.personal_export.download",
+        {
+            "performed_by": actor.username,
+            "acting_as": actor.username,
+            "source": "api",
+            "target": target_user["username"],
+            "mode": mode,
+            "board": board,
+            "sort": effective_sort,
+            "limit": limit,
+            "offset": offset,
+            "q": q,
+            "aliases": alias_list,
+            "filename": filename,
+        },
+    )
+    return Response(
+        content=body,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/threads", response_model=ThreadDetail, status_code=status.HTTP_201_CREATED)
@@ -1441,6 +1717,28 @@ def export_thread(thread_id: int, actor: Actor = Depends(require_actor)) -> Expo
     return ExportResult(thread_id=thread_id, output_path=str(output), status="needs_review")
 
 
+@router.get("/export/thread/{thread_id}/markdown")
+def download_thread_markdown(thread_id: int, actor: Actor = Depends(require_actor)) -> Response:
+    detail = get_thread(thread_id)
+    body = render_export_markdown(detail, actor.username)
+    filename = thread_export_filename(detail)
+    append_audit(
+        "thread.export.download",
+        {
+            "performed_by": actor.username,
+            "acting_as": actor.username,
+            "source": "api",
+            "thread_id": thread_id,
+            "filename": filename,
+        },
+    )
+    return Response(
+        content=body,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 def render_export_markdown(detail: ThreadDetail, requested_by: str) -> str:
     created = datetime.now(UTC).isoformat()
     lines = [
@@ -1488,3 +1786,314 @@ def render_export_markdown(detail: ThreadDetail, requested_by: str) -> str:
             ]
         )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def personal_match_reasons(threads: list[ThreadSummary], target_user_id: int, aliases: list[str]) -> dict[int, str]:
+    if not threads:
+        return {}
+    reasons: dict[int, str] = {}
+    with get_connection() as conn:
+        for thread in threads:
+            labels: list[str] = []
+            mention_sql, mention_params = mention_filter_sql(aliases)
+            row = conn.execute(
+                f"SELECT 1 FROM threads WHERE threads.id = ? AND {mention_sql} LIMIT 1",
+                (thread.id, *mention_params),
+            ).fetchone()
+            if row is not None:
+                labels.append("alias_mention")
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM posts mine
+                JOIN posts other ON other.thread_id = mine.thread_id
+                WHERE mine.thread_id = ?
+                  AND mine.author_user_id = ?
+                  AND mine.status = 'visible'
+                  AND other.status = 'visible'
+                  AND other.author_user_id != ?
+                  AND other.parent_post_id = mine.id
+                LIMIT 1
+                """,
+                (thread.id, target_user_id, target_user_id),
+            ).fetchone()
+            if row is not None:
+                labels.append("direct_reply")
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM posts mine
+                JOIN posts other ON other.thread_id = mine.thread_id
+                WHERE mine.thread_id = ?
+                  AND mine.author_user_id = ?
+                  AND mine.status = 'visible'
+                  AND other.status = 'visible'
+                  AND other.author_user_id != ?
+                  AND other.created_at > mine.created_at
+                LIMIT 1
+                """,
+                (thread.id, target_user_id, target_user_id),
+            ).fetchone()
+            if row is not None and "direct_reply" not in labels:
+                labels.append("thread_update_after_target")
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM posts operator_posts
+                JOIN users operator_user ON operator_user.id = operator_posts.author_user_id
+                WHERE operator_posts.thread_id = ?
+                  AND operator_posts.status = 'visible'
+                  AND operator_user.role IN ('admin', 'moderator')
+                LIMIT 1
+                """,
+                (thread.id,),
+            ).fetchone()
+            if row is not None:
+                labels.append("operator_participated")
+            if labels:
+                reasons[thread.id] = ", ".join(labels)
+    return reasons
+
+
+def alias_match_snippets(threads: list[ThreadSummary], aliases: list[str]) -> dict[int, str]:
+    if not threads:
+        return {}
+    snippets: dict[int, str] = {}
+    with get_connection() as conn:
+        for thread in threads:
+            snippet = find_alias_snippet(thread.title, aliases)
+            if snippet is None:
+                rows = conn.execute(
+                    """
+                    SELECT body_markdown
+                    FROM posts
+                    WHERE thread_id = ? AND status = 'visible'
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (thread.id,),
+                ).fetchall()
+                for row in rows:
+                    snippet = find_alias_snippet(row["body_markdown"] or "", aliases)
+                    if snippet is not None:
+                        break
+            if snippet is not None:
+                snippets[thread.id] = snippet
+    return snippets
+
+
+def find_alias_snippet(text: str, aliases: list[str], radius: int = 54) -> str | None:
+    compact = " ".join((text or "").split())
+    for alias in sorted(aliases, key=len, reverse=True):
+        match = alias_match(compact, alias)
+        if match is None:
+            continue
+        index, match_length = match
+        start = max(0, index - radius)
+        end = min(len(compact), index + match_length + radius)
+        snippet = compact[start:end].strip()
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(compact):
+            snippet = snippet + "..."
+        return snippet
+    return None
+
+
+def alias_match(text: str, alias: str) -> tuple[int, int] | None:
+    if is_short_latin_alias(alias):
+        match = re.search(rf"(?<![A-Za-z0-9_-])@?{re.escape(alias)}(?![A-Za-z0-9_-])", text, re.IGNORECASE)
+        if match is None:
+            return None
+        return match.start(), match.end() - match.start()
+    index = text.casefold().find(alias.casefold())
+    if index < 0:
+        return None
+    return index, len(alias)
+
+
+def action_reason(match_reason: str) -> str:
+    if "direct_reply" in match_reason:
+        return "direct_reply"
+    if "thread_update_after_target" in match_reason:
+        return "updated_after_target_reply"
+    if "operator_participated" in match_reason:
+        return "operator_participated"
+    if "alias_mention" in match_reason:
+        return "alias_mention"
+    return "related_activity"
+
+
+def render_thread_list_markdown(
+    threads: list[ThreadSummary],
+    total: int,
+    board: str | None,
+    sort: str,
+    limit: int,
+    offset: int,
+    q: str | None,
+    requested_by: str,
+    target_user: dict | None = None,
+    personal_mode: str | None = None,
+    aliases: list[str] | None = None,
+    reasons: dict[int, str] | None = None,
+    match_snippets: dict[int, str] | None = None,
+) -> str:
+    generated_at = datetime.now(UTC).isoformat()
+    title = thread_list_title(board=board, sort=sort, q=q, target_user=target_user, personal_mode=personal_mode)
+    lines = [
+        "---",
+        f"id: forum-list-export-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}",
+        f"created_at: {generated_at}",
+        "source: agent-forum-kit",
+        f"requested_by: {requested_by}",
+        "type: forum-list-export",
+        "status: local_export",
+        "sensitivity: private",
+        "allowed_ops:",
+        "  - read",
+        f"forum_board: {board or 'all'}",
+        f"forum_sort: {sort}",
+        f"forum_query: {q.strip() if q and q.strip() else ''}",
+        f"thread_total: {total}",
+        f"thread_offset: {offset}",
+        f"thread_limit: {limit}",
+    ]
+    if target_user:
+        lines.extend(
+            [
+                f"target_username: {target_user['username']}",
+                f"target_display_name: {target_user['display_name']}",
+                f"target_persona_id: {target_user.get('persona_id') or ''}",
+                f"personal_mode: {personal_mode or 'latest'}",
+                "target_aliases:",
+            ]
+        )
+        for alias in aliases or []:
+            lines.append(f"  - {alias}")
+    lines.extend(
+        [
+            "---",
+            "",
+            f"# {title}",
+            "",
+            f"- Generated at: {generated_at}",
+            f"- Requested by: {requested_by}",
+            f"- Board: {board or 'all'}",
+            f"- Sort: {sort}",
+            f"- Search: {q.strip() if q and q.strip() else '(none)'}",
+            f"- Showing: {len(threads)} of {total} matching threads",
+            f"- Offset: {offset}",
+            f"- Limit: {limit}",
+        ]
+    )
+    if target_user:
+        lines.extend(
+            [
+                f"- Target: {target_user['display_name']} / {target_user['username']}",
+                f"- Personal mode: {personal_mode or 'latest'}",
+                f"- Target aliases: {', '.join(aliases or [])}",
+            ]
+        )
+    lines.append("")
+    if not threads:
+        lines.extend(["No matching threads in this list snapshot.", ""])
+        return "\n".join(lines).rstrip() + "\n"
+
+    for index, thread in enumerate(threads, start=offset + 1):
+        latest_author = thread.latest_post_author.display_name if thread.latest_post_author else "(none)"
+        lines.extend(
+            [
+                f"## {index}. {thread.title}",
+                "",
+                f"- Thread ID: {thread.id}",
+                f"- Board: {thread.board_slug}",
+                f"- Author: {thread.author.display_name} / {thread.author.username}",
+                f"- Created at: {thread.created_at}",
+                f"- Updated at: {thread.updated_at}",
+                f"- Status: {thread.status}",
+                f"- Replies: {thread.reply_count}",
+                f"- Latest post at: {thread.latest_post_at or '(none)'}",
+                f"- Latest author: {latest_author}",
+                f"- Local URL: /threads/{thread.id}",
+            ]
+        )
+        if reasons and reasons.get(thread.id):
+            lines.append(f"- Personal match: {reasons[thread.id]}")
+            if "alias_mention" in reasons[thread.id] and match_snippets and match_snippets.get(thread.id):
+                lines.append(f"- Match snippet: {match_snippets[thread.id]}")
+            if personal_mode == "action_required":
+                lines.append(f"- Action reason: {action_reason(reasons[thread.id])}")
+        lines.extend(["", "### Main Excerpt", "", blockquote(thread.excerpt or "(empty)"), ""])
+        if thread.latest_post_excerpt and thread.latest_post_excerpt != thread.excerpt:
+            lines.extend(["### Latest Reply Excerpt", "", blockquote(thread.latest_post_excerpt), ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def thread_list_title(
+    board: str | None,
+    sort: str,
+    q: str | None,
+    target_user: dict | None = None,
+    personal_mode: str | None = None,
+) -> str:
+    if target_user:
+        mode_label = {
+            "latest": "Latest",
+            "related": "Related",
+            "mentions": "Mentions",
+            "replies": "Replies",
+            "action_required": "Action Required",
+        }.get(personal_mode or "latest", personal_mode or "Latest")
+        if q and q.strip():
+            return f"Forum {mode_label} List for {target_user['display_name']}: {q.strip()}"
+        return f"Forum {mode_label} List for {target_user['display_name']}"
+    if q and q.strip():
+        return f"Forum Search List: {q.strip()}"
+    if board:
+        suffix = "Latest" if sort == "latest" else "Hot"
+        return f"Forum {suffix} List: {board}"
+    return "Forum Latest List" if sort == "latest" else "Forum Hot List"
+
+
+def blockquote(text: str) -> str:
+    compact = text.strip() or "(empty)"
+    return "\n".join(f"> {line}" if line else ">" for line in compact.splitlines())
+
+
+def ascii_slug(value: str, fallback: str = "export", limit: int = 80) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9.-]+", "-", ascii_text.replace("_", "-")).strip("-._").lower()
+    return (slug or fallback)[:limit].strip("-._") or fallback
+
+
+def thread_export_filename(detail: ThreadDetail) -> str:
+    slug = ascii_slug(detail.title, fallback="thread", limit=48)
+    return f"forum-thread-{detail.id}-{slug}.md"
+
+
+def thread_list_export_filename(board: str | None, sort: str, q: str | None) -> str:
+    scope = ascii_slug(board or "all", fallback="all", limit=32)
+    suffix = ascii_slug(q or "", fallback="", limit=32) if q and q.strip() else ""
+    parts = ["forum-list", scope, sort]
+    if suffix:
+        parts.append(suffix)
+    parts.append(datetime.now(UTC).strftime("%Y%m%d%H%M%S"))
+    return "-".join(parts) + ".md"
+
+
+def personal_thread_list_export_filename(
+    target_user: dict,
+    mode: str,
+    board: str | None,
+    sort: str,
+    q: str | None,
+) -> str:
+    target = ascii_slug(str(target_user["username"]), fallback="agent", limit=32)
+    scope = ascii_slug(board or "all", fallback="all", limit=32)
+    suffix = ascii_slug(q or "", fallback="", limit=32) if q and q.strip() else ""
+    parts = ["forum-list", target, mode.replace("_", "-"), scope, sort]
+    if suffix:
+        parts.append(suffix)
+    parts.append(datetime.now(UTC).strftime("%Y%m%d%H%M%S"))
+    return "-".join(parts) + ".md"

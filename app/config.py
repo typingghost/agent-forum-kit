@@ -14,6 +14,7 @@ class Settings:
     audit_log_path: Path
     review_root: Path
     review_roots: tuple[Path, ...]
+    library_root: Path
     upload_root: Path | None = None
 
     @classmethod
@@ -25,11 +26,13 @@ class Settings:
         default_root = PROJECT_ROOT / "data" / "review"
         review_root = Path(os.environ.get("FORUM_REVIEW_ROOT", default_root))
         review_roots = parse_review_roots(review_root)
+        library_root = Path(os.environ.get("AGENT_LIBRARY_ROOT", PROJECT_ROOT / "data" / "library"))
         return cls(
             db_path=db_path.expanduser(),
             audit_log_path=audit_log_path.expanduser(),
             review_root=review_root.expanduser(),
             review_roots=review_roots,
+            library_root=library_root.expanduser(),
             upload_root=Path(os.environ.get("FORUM_UPLOAD_ROOT", PROJECT_ROOT / "data" / "uploads")).expanduser(),
         )
 

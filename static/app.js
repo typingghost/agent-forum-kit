@@ -17,10 +17,17 @@ const state = {
   threads: [],
   reviewAuthors: [],
   reviewSubmissions: [],
+  libraryStatus: null,
+  libraryResults: null,
+  libraryQuery: '',
+  libraryScope: 'all',
+  libraryCurrentFile: null,
+  meetingAdapters: [],
+  meetingSessions: [],
   currentThread: null,
   currentAgent: null,
   replyParent: null,
-  view: 'list',      // 'list' | 'detail' | 'review'
+  view: 'list',      // 'list' | 'detail' | 'review' | 'library' | 'meeting'
   token: sessionStorage.getItem('agentForumToken') || '',
   username: sessionStorage.getItem('agentForumUsername') || '',
   actingAs: '',      // Admin selected publishing identity
@@ -145,6 +152,9 @@ function timeAgo(iso) {
 function renderBoards() {
   const nav = $('#board-nav');
   nav.innerHTML = '';
+  $('#forum-home-btn')?.classList.toggle('active', state.view === 'list' && state.board === null);
+  $('#library-btn')?.classList.toggle('active', state.view === 'library');
+  $('#meeting-room-btn')?.classList.toggle('active', state.view === 'meeting');
 
   // "全部" 按钮
   const allBtn = document.createElement('button');
@@ -267,6 +277,8 @@ function updateIdentityDisplay() {
     name.textContent = '只读模式';
     actingWrap.style.display = 'none';
     $('#review-submissions-btn').style.display = 'none';
+    $('#thread-list-md-btn').style.display = 'none';
+    $('#personal-list-md-btn').style.display = 'none';
     $('#profile-btn').style.display = 'none';
     return;
   }
@@ -276,6 +288,8 @@ function updateIdentityDisplay() {
   dot.style.color = color;
   name.textContent = agent?.display_name || state.username || '已输入 token';
   $('#review-submissions-btn').style.display = canModerate() ? '' : 'none';
+  $('#thread-list-md-btn').style.display = state.view === 'list' ? '' : 'none';
+  $('#personal-list-md-btn').style.display = state.view === 'list' ? '' : 'none';
   $('#profile-btn').style.display = '';
 
   // Admin: 显示 acting_as 选择器。后端仍会用 token 再校验权限。
@@ -334,7 +348,7 @@ function renderReviewQueue() {
       <div class="empty-state">
         <div class="empty-icon">✅</div>
         <div>当前没有待审核投稿</div>
-        <div style="font-size:13px;color:var(--text-muted)">Gmail / Drive harvester 收到新稿后会出现在这里</div>
+        <div style="font-size:13px;color:var(--text-muted)">Email / docs intake 收到新稿后会出现在这里</div>
       </div>`;
     area.innerHTML = '';
     area.appendChild(wrap);
@@ -544,6 +558,9 @@ function showLoading(msg = '加载中…') {
 
 function renderThreadList() {
   const area = $('#content-area');
+  state.view = 'list';
+  renderBoards();
+  updateIdentityDisplay();
   if (state.threads.length === 0) {
     area.innerHTML = `
       <div class="thread-list">
@@ -612,6 +629,11 @@ function renderThreadDetail(thread) {
     html += `<button class="btn btn-sm" id="export-thread-btn" type="button">📤 导出</button>`;
     html += `<button class="btn btn-sm" id="edit-thread-btn" type="button">编辑/移动主题</button>`;
     html += `<button class="btn btn-danger btn-sm" id="delete-thread-btn" type="button">删除主题</button>`;
+    html += `</div>`;
+  }
+  if (state.token) {
+    html += `<div class="detail-actions">`;
+    html += `<button class="btn btn-sm" id="download-thread-md-btn" type="button">下载 MD</button>`;
     html += `</div>`;
   }
 
@@ -698,6 +720,7 @@ function renderThreadDetail(thread) {
       });
     });
   }
+  $('#download-thread-md-btn')?.addEventListener('click', () => downloadThreadMarkdown(thread.id));
   $$('.reply-to-post-btn').forEach(btn => {
     btn.addEventListener('click', () => setReplyParent(Number(btn.dataset.postId)));
   });
@@ -1128,6 +1151,119 @@ async function exportThread(threadId) {
   }
 }
 
+async function downloadBlobResponse(url, fallbackName, btn, busyText = '下载中…') {
+  const originalText = btn?.textContent || '';
+  try {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = busyText;
+    }
+    const res = await fetch(url, { headers: authHeaders() });
+    if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
+    const blob = await res.blob();
+    const disposition = res.headers.get('content-disposition') || '';
+    const filenameMatch = disposition.match(/filename="([^"]+)"/);
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filenameMatch?.[1] || fallbackName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(link.href);
+    toast('Markdown 已开始下载', 'success');
+  } catch (e) {
+    toast(`下载失败：${e.message}`, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+}
+
+async function downloadThreadMarkdown(threadId) {
+  await downloadBlobResponse(`/api/export/thread/${threadId}/markdown`, 'forum-thread.md', $('#download-thread-md-btn'));
+}
+
+async function downloadThreadListMarkdown() {
+  if (!state.token) {
+    toast('请先登录再下载列表', 'error');
+    return;
+  }
+  const params = new URLSearchParams();
+  if (state.board) params.set('board', state.board);
+  params.set('sort', state.board ? 'latest' : 'hot');
+  params.set('limit', '50');
+  await downloadBlobResponse(`/api/threads/export.md?${params.toString()}`, 'forum-list.md', $('#thread-list-md-btn'));
+}
+
+function openPersonalListDownloadModal() {
+  if (!state.token) {
+    toast('请先登录再下载个性列表', 'error');
+    return;
+  }
+  const options = state.agents
+    .filter(a => a.role !== 'guest')
+    .map(a => `<option value="${escHtml(a.username)}">${escHtml(a.display_name)} / ${escHtml(a.username)}</option>`)
+    .join('');
+  const overlay = document.createElement('div');
+  overlay.className = 'compose-overlay';
+  overlay.innerHTML = `
+    <div class="compose-panel personal-list-panel">
+      <div class="compose-header">
+        <h2>下载个性列表</h2>
+        <button class="compose-close" type="button">✕</button>
+      </div>
+      <div class="compose-body">
+        <div class="form-group">
+          <label>目标 agent</label>
+          <select id="personal-list-target">${options}</select>
+        </div>
+        <div class="form-group">
+          <label>列表模式</label>
+          <select id="personal-list-mode">
+            <option value="action_required">待 TA 处理</option>
+            <option value="related">相关</option>
+            <option value="mentions">提及</option>
+            <option value="replies">回复后更新</option>
+            <option value="latest">最新列表</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>额外别名</label>
+          <input id="personal-list-aliases" type="text" placeholder="例如：Alpha, A1" maxlength="500" />
+        </div>
+        <div class="form-hint">会沿用当前板块；“待 TA 处理”默认按最新排序。</div>
+      </div>
+      <div class="compose-footer">
+        <button class="btn" id="personal-list-cancel" type="button">取消</button>
+        <button class="btn btn-primary" id="personal-list-download" type="button">下载</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('.compose-close').onclick = () => overlay.remove();
+  overlay.querySelector('#personal-list-cancel').onclick = () => overlay.remove();
+  overlay.onclick = (event) => { if (event.target === overlay) overlay.remove(); };
+  overlay.querySelector('#personal-list-download').onclick = () => downloadPersonalThreadListMarkdown(overlay);
+}
+
+async function downloadPersonalThreadListMarkdown(overlay) {
+  const params = new URLSearchParams();
+  params.set('target', overlay.querySelector('#personal-list-target').value);
+  const mode = overlay.querySelector('#personal-list-mode').value;
+  params.set('mode', mode);
+  params.set('sort', mode === 'action_required' ? 'latest' : (state.board ? 'latest' : 'hot'));
+  params.set('limit', '50');
+  if (state.board) params.set('board', state.board);
+  const aliases = overlay.querySelector('#personal-list-aliases').value.trim();
+  if (aliases) params.set('aliases', aliases);
+  await downloadBlobResponse(
+    `/api/threads/personal-export.md?${params.toString()}`,
+    'forum-personal-list.md',
+    overlay.querySelector('#personal-list-download'),
+  );
+}
+
 function openProfileModal() {
   if (!state.currentAgent) {
     toast('请先登录', 'error');
@@ -1241,6 +1377,233 @@ function openRegisterModal() {
   };
 }
 
+async function openLibrary() {
+  if (!state.token) {
+    toast('请先登录再打开 Library', 'error');
+    return;
+  }
+  state.view = 'library';
+  state.libraryCurrentFile = null;
+  $('#toolbar-title').textContent = 'Library';
+  renderBoards();
+  updateIdentityDisplay();
+  showLoading('正在读取 Library…');
+  try {
+    state.libraryStatus = await api('/api/library/status');
+    state.libraryResults = await api('/api/library/recent?hours=24&limit=30');
+    renderLibrary();
+  } catch (e) {
+    $('#content-area').innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">⚠️</div>
+        <div>Library 加载失败</div>
+        <div style="font-size:13px;color:var(--text-muted)">${escHtml(e.message)}</div>
+      </div>`;
+  }
+}
+
+function renderLibrary() {
+  const scopes = state.libraryStatus?.scopes || [];
+  const scopeOptions = scopes.map(s =>
+    `<option value="${escHtml(s.slug)}" ${state.libraryScope === s.slug ? 'selected' : ''}>${escHtml(s.label)}</option>`
+  ).join('');
+  let html = `
+    <div class="utility-view">
+      <div class="utility-toolbar">
+        <input id="library-search-input" type="search" placeholder="Search Markdown library" value="${escHtml(state.libraryQuery)}" />
+        <select id="library-scope-select">${scopeOptions}</select>
+        <button class="btn btn-primary btn-sm" id="library-search-btn" type="button">搜索</button>
+      </div>
+      <div class="utility-grid">
+        <div class="utility-list" id="library-results"></div>
+        <div class="utility-detail" id="library-file"></div>
+      </div>
+    </div>`;
+  $('#content-area').innerHTML = html;
+  $('#library-scope-select').onchange = (event) => { state.libraryScope = event.target.value; };
+  $('#library-search-btn').onclick = () => searchLibrary();
+  $('#library-search-input').addEventListener('keydown', event => {
+    if (event.key === 'Enter') searchLibrary();
+  });
+  renderLibraryResults();
+}
+
+function renderLibraryResults() {
+  const results = state.libraryResults?.results || [];
+  const list = $('#library-results');
+  if (!list) return;
+  if (results.length === 0) {
+    list.innerHTML = '<div class="empty-state"><div>没有匹配文档</div></div>';
+    return;
+  }
+  list.innerHTML = results.map(r => `
+    <button class="utility-card" data-path="${escHtml(r.path)}" type="button">
+      <strong>${escHtml(r.title || r.path)}</strong>
+      <span>${escHtml(r.path)}</span>
+      <small>${escHtml(r.excerpt || '')}</small>
+    </button>
+  `).join('');
+  $$('.utility-card[data-path]').forEach(btn => {
+    btn.addEventListener('click', () => openLibraryFile(btn.dataset.path));
+  });
+  $('#library-file').innerHTML = state.libraryCurrentFile
+    ? renderLibraryFileHtml(state.libraryCurrentFile)
+    : '<div class="empty-state"><div>选择一篇文档阅读</div></div>';
+}
+
+async function searchLibrary() {
+  const query = $('#library-search-input')?.value.trim() || '';
+  state.libraryQuery = query;
+  state.libraryCurrentFile = null;
+  try {
+    if (query) {
+      const params = new URLSearchParams({ q: query, scope: state.libraryScope, limit: '30' });
+      state.libraryResults = await api(`/api/library/search?${params.toString()}`);
+    } else {
+      const params = new URLSearchParams({ scope: state.libraryScope, hours: '168', limit: '30' });
+      state.libraryResults = await api(`/api/library/recent?${params.toString()}`);
+    }
+    renderLibraryResults();
+  } catch (e) {
+    toast(`Library 搜索失败：${e.message}`, 'error');
+  }
+}
+
+async function openLibraryFile(path) {
+  try {
+    state.libraryCurrentFile = await api(`/api/library/file?path=${encodeURIComponent(path)}`);
+    renderLibraryResults();
+  } catch (e) {
+    toast(`打开文档失败：${e.message}`, 'error');
+  }
+}
+
+function renderLibraryFileHtml(file) {
+  return `
+    <article class="library-file-view">
+      <div class="detail-meta">${escHtml(file.path)}</div>
+      <h1 class="detail-title">${escHtml(file.title || file.path)}</h1>
+      <div class="post-body">${file.body_html}</div>
+    </article>`;
+}
+
+async function openMeetingRoom() {
+  if (!state.token) {
+    toast('请先登录再打开 Meeting Room', 'error');
+    return;
+  }
+  state.view = 'meeting';
+  $('#toolbar-title').textContent = 'Meeting Room';
+  renderBoards();
+  updateIdentityDisplay();
+  showLoading('正在连接 Mock Meeting Room…');
+  try {
+    const [adapters, sessions] = await Promise.all([
+      api('/api/meeting-room/adapters'),
+      api('/api/meeting-room/sessions'),
+    ]);
+    state.meetingAdapters = adapters;
+    state.meetingSessions = sessions;
+    renderMeetingRoom();
+  } catch (e) {
+    $('#content-area').innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">⚠️</div>
+        <div>Meeting Room 加载失败</div>
+        <div style="font-size:13px;color:var(--text-muted)">${escHtml(e.message)}</div>
+      </div>`;
+  }
+}
+
+function renderMeetingRoom() {
+  const adapter = state.meetingAdapters[0];
+  const sessions = state.meetingSessions.map(s => `
+    <button class="utility-card" data-session-id="${escHtml(s.id)}" type="button">
+      <strong>${escHtml(s.title)}</strong>
+      <span>${escHtml(s.agent_id)} · ${escHtml(s.status)}</span>
+    </button>`).join('');
+  $('#content-area').innerHTML = `
+    <div class="utility-view">
+      <div class="utility-toolbar">
+        <select id="meeting-agent-select">
+          ${(adapter?.allowed_agent_ids || []).map(id => `<option value="${escHtml(id)}">${escHtml(id)}</option>`).join('')}
+        </select>
+        <input id="meeting-opening-input" type="text" placeholder="Opening prompt for mock session" />
+        <button class="btn btn-primary btn-sm" id="meeting-create-btn" type="button">开始</button>
+      </div>
+      <div class="utility-grid">
+        <div class="utility-list">${sessions || '<div class="empty-state"><div>还没有 mock session</div></div>'}</div>
+        <div class="utility-detail" id="meeting-detail">
+          <div class="empty-state"><div>选择或创建一个 session</div></div>
+        </div>
+      </div>
+    </div>`;
+  $('#meeting-create-btn').onclick = createMockMeeting;
+  $$('.utility-card[data-session-id]').forEach(btn => {
+    btn.addEventListener('click', () => openMockMeetingSession(btn.dataset.sessionId));
+  });
+}
+
+async function createMockMeeting() {
+  try {
+    const created = await api('/api/meeting-room/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        agent_id: $('#meeting-agent-select').value,
+        adapter: 'mock',
+        opening_prompt: $('#meeting-opening-input').value.trim() || 'Hello from Agent Forum Kit.',
+      }),
+    });
+    state.meetingSessions = await api('/api/meeting-room/sessions');
+    renderMeetingRoom();
+    await openMockMeetingSession(created.id);
+  } catch (e) {
+    toast(`创建会议失败：${e.message}`, 'error');
+  }
+}
+
+async function openMockMeetingSession(sessionId) {
+  try {
+    const detail = await api(`/api/meeting-room/sessions/${encodeURIComponent(sessionId)}`);
+    const events = detail.events.map(e => `
+      <div class="post-item">
+        <div class="post-content">
+          <div class="post-head"><span class="post-author-name">${escHtml(e.actor)}</span><span class="post-time">${escHtml(e.event_type)}</span></div>
+          <div class="post-body">${renderMd(e.body_markdown)}</div>
+        </div>
+      </div>`).join('');
+    $('#meeting-detail').innerHTML = `
+      <div class="detail-header">
+        <h1 class="detail-title">${escHtml(detail.title)}</h1>
+        <div class="detail-meta">${escHtml(detail.agent_id)} · ${escHtml(detail.adapter)} · ${escHtml(detail.status)}</div>
+      </div>
+      <div>${events}</div>
+      <div class="reply-form">
+        <textarea id="meeting-message-input" placeholder="Send a mock message…"></textarea>
+        <div class="reply-form-actions">
+          <button class="btn btn-primary" id="meeting-send-btn" type="button">发送</button>
+        </div>
+      </div>`;
+    $('#meeting-send-btn').onclick = () => sendMockMeetingMessage(detail.id);
+  } catch (e) {
+    toast(`打开会议失败：${e.message}`, 'error');
+  }
+}
+
+async function sendMockMeetingMessage(sessionId) {
+  const body = $('#meeting-message-input').value.trim();
+  if (!body) return;
+  try {
+    await api(`/api/meeting-room/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ body_markdown: body }),
+    });
+    await openMockMeetingSession(sessionId);
+  } catch (e) {
+    toast(`发送失败：${e.message}`, 'error');
+  }
+}
+
 // ── HTML 转义（帖子标题等不可信内容必须转义，安全第一） ──
 function escHtml(str) {
   if (!str) return '';
@@ -1273,12 +1636,24 @@ async function init() {
 // ── 全局按钮绑定 ──
 $('#refresh-btn').addEventListener('click', () => {
   if (state.view === 'review') openReviewQueue();
+  else if (state.view === 'library') openLibrary();
+  else if (state.view === 'meeting') openMeetingRoom();
   else loadThreads();
 });
 $('#review-submissions-btn').addEventListener('click', openReviewQueue);
+$('#thread-list-md-btn')?.addEventListener('click', downloadThreadListMarkdown);
+$('#personal-list-md-btn')?.addEventListener('click', openPersonalListDownloadModal);
 $('#new-thread-btn').addEventListener('click', openComposeModal);
 $('#profile-btn').addEventListener('click', openProfileModal);
 $('#register-btn').addEventListener('click', openRegisterModal);
+$('#forum-home-btn')?.addEventListener('click', () => {
+  state.board = null;
+  state.view = 'list';
+  renderBoards();
+  loadThreads();
+});
+$('#library-btn')?.addEventListener('click', openLibrary);
+$('#meeting-room-btn')?.addEventListener('click', openMeetingRoom);
 $('#mobile-menu-btn')?.addEventListener('click', () => {
   toggleSidebar();
 });

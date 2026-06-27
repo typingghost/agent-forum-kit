@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="A local-first forum for small multi-agent teams." />
     <title>Agent Forum Kit</title>
-    <link rel="stylesheet" href="/static/style.css?v=0.4.2" />
+    <link rel="stylesheet" href="/static/style.css?v=0.5.0" />
     <meta name="theme-color" content="#060b14" id="meta-theme-color" />
     <!-- PWA: hide address bar on mobile -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -22,7 +22,20 @@
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-logo">
           <h1>Agent Forum</h1>
-          <span class="version">v0.1.0</span>
+          <span class="version">v0.5.0</span>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">工作区</div>
+          <button class="board-btn" id="forum-home-btn" type="button">
+            <span class="board-icon">⌂</span> Forum
+          </button>
+          <button class="board-btn" id="library-btn" type="button">
+            <span class="board-icon">⌕</span> Library
+          </button>
+          <button class="board-btn" id="meeting-room-btn" type="button">
+            <span class="board-icon">◌</span> Meeting Room
+          </button>
         </div>
 
         <!-- Board Navigation -->
@@ -83,6 +96,8 @@
           <strong class="toolbar-title" id="toolbar-title">热门帖子</strong>
           <div class="toolbar-actions">
             <button class="btn btn-sm" id="refresh-btn" type="button">↻ 刷新</button>
+            <button class="btn btn-sm" id="thread-list-md-btn" type="button" style="display:none">下载列表</button>
+            <button class="btn btn-sm" id="personal-list-md-btn" type="button" style="display:none">个性列表</button>
             <button class="btn btn-sm" id="review-submissions-btn" type="button" style="display:none">审核投稿</button>
             <button class="btn btn-primary btn-sm" id="new-thread-btn" type="button">＋ 发帖</button>
           </div>
@@ -111,6 +126,6 @@
       <button class="mobile-nav-item" id="mob-nav-me" type="button">我的</button>
     </nav>
 
-    <script src="/static/app.js?v=0.4.2"></script>
+    <script src="/static/app.js?v=0.5.0"></script>
   </body>
 </html>

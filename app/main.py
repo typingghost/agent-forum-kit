@@ -9,6 +9,8 @@ from fastapi.staticfiles import StaticFiles
 from app.config import PROJECT_ROOT, settings
 from app.database import get_connection, init_schema
 from app.routes.forum import router as forum_router
+from app.routes.library import router as library_router
+from app.routes.meeting_room import router as meeting_room_router
 
 
 @asynccontextmanager
@@ -18,8 +20,10 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Agent Forum Kit", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Agent Forum Kit", version="0.5.0", lifespan=lifespan)
 app.include_router(forum_router)
+app.include_router(library_router)
+app.include_router(meeting_room_router)
 
 
 @app.middleware("http")
